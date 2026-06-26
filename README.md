@@ -1,171 +1,241 @@
-# URA Hackathon 2026 – OCR & Product Recognition Pipeline v5.0
+# 🏆 TANAHI — Hệ thống Nhận diện Sản phẩm từ Ảnh Mạng Xã hội
+### URA Hackathon 2026 | Nhóm TANAHI | HCMUT
 
-> **Competition:** [The 2nd URA Hackathon 2026](https://www.kaggle.com/competitions/the-2nd-ura-hackathon)  
-> **Task:** Given product images (social-media screenshots, shelf photos, ads), extract OCR text and identify the **brand name** and **product name** separately.  
-> **Metric:**
-> ```
-> Score = 0.40 × F1_brand + 0.35 × (1 − CER) + 0.25 × F1_product
-> ```
+> **Điểm thi:** `Score = 0.40 × F1_brand + 0.35 × (1 - CER) + 0.25 × F1_product`  
+> **Môi trường:** Kaggle CPU Kernel · Python 3.12 · 30 GB RAM
 
 ---
 
-## 📓 Notebook
-
-**[`have_train.ipynb`](have_train.ipynb)** – Final submission notebook  
-Executed: **2026-06-23** · Runtime: ~25 min on Kaggle CPU (4 threads, 1 202 private-test images)
+## 📋 Mục lục
+- [Bài toán](#bài-toán)
+- [Ý tưởng hệ thống](#ý-tưởng-hệ-thống)
+- [Kiến trúc pipeline](#kiến-trúc-pipeline)
+- [Cài đặt & Chạy lại](#cài-đặt--chạy-lại)
+- [Chi tiết từng module](#chi-tiết-từng-module)
+- [Kết quả](#kết-quả)
 
 ---
 
-## 🔑 Pipeline Overview
+## 🎯 Bài toán
+
+Cuộc thi yêu cầu xây dựng pipeline AI **nhẹ, không cần GPU** để trích xuất thông tin sản phẩm từ ảnh mạng xã hội.
+
+**Input:** Ảnh TikTok/Instagram (JPG, PNG, GIF, video)
+
+**Output (CSV):**
+
+| Cột | Mô tả | Ví dụ |
+|---|---|---|
+| `image_id` | ID ảnh | `priv_h_0001` |
+| `ocr_text` | Toàn bộ text trong ảnh | `"Sữa tươi Vinamilk Flex 180ml"` |
+| `brand_name` | Tên thương hiệu | `"Vinamilk"` |
+| `product_name` | Tên dòng sản phẩm | `"Flex"` |
+
+**Thách thức:** ảnh mạng xã hội nhiễu · watermark · text nhỏ/nghiêng · song ngữ Việt-Anh · GIF/video · chỉ CPU
+
+---
+
+## 💡 Ý tưởng hệ thống
+
+### Vấn đề & Giải pháp
+
+**1. OCR tiếng Việt không chính xác**
+- PaddleOCR đọc sai dấu (Sữa → Sua), VietOCR cần biết vị trí từng từ
+- → **Dual-Engine:** Paddle detect bounding boxes → VietOCR recognize từng crop
+
+**2. ML thuần không generalize**
+- ~5,000 mẫu train không đủ cho brand/product mới
+- → **3 tầng prediction có ưu tiên:** Rules → ML → Layout
+
+**3. Model "bịa" brand**
+- Classifier có thể gán brand không có trong ảnh
+- → **Anti-hallucination:** kiểm tra token brand có trong OCR text không
+
+**4. Session Kaggle timeout**
+- Chạy 1,200 ảnh mất 30-45 phút, dễ bị ngắt
+- → **Checkpoint mỗi 50 ảnh**, tự resume khi chạy lại
+
+---
+
+## 🏗️ Kiến trúc Pipeline
 
 ```
-Image
-  └─► PaddleOCR (CPU, latin_PP-OCRv3 + ch_PP-OCRv4 detector)
-          └─► clean_social_ocr()           ← strip @, #, URLs, timestamps
-              └─► _is_ocr_noise_only()     ← discard pure-noise text
-                    │
-                    ├─► extract_by_rules()     ← 46 brand regex rules
-                    │         └─► post_process_prediction()
-                    │
-                    ├─► detect_brand_in_ocr()  ← BRAND_REGISTRY longest-alias match
-                    │
-                    ├─► BrandClassifier + ProductClassifier (TF-IDF + LogReg)
-                    │
-                    └─► split_brand_product()  ← MERGED_SPLIT → (brand_name, product_name)
-                              └─► submission.csv
+📸 INPUT (JPG/PNG/GIF/Video)
+       │
+       ▼
+┌─────────────────┐
+│  PREPROCESSING  │  Resize + Contrast ×1.45 + Sharpen
+│  (Cell 7b)      │  GIF/Video: chọn frame nét nhất
+└────────┬────────┘  (Laplacian variance)
+         │
+         ▼
+┌──────────────────────────────────────┐
+│        OCR DUAL ENGINE (Cell 7)      │
+│                                      │
+│  PaddleOCR PP-OCRv4  →  Bounding   │
+│  (Detection Only)        Boxes       │
+│           ↓                          │
+│  Crop từng box (padding 3px)         │
+│           ↓                          │
+│  VietOCR vgg_seq2seq → Text/crop    │
+│  (Recognition)                       │
+│           ↓                          │
+│  Sort boxes (reading order)          │
+│  Bilingual Post-Processor            │
+│  → ocr_text (cleaned)               │
+└────────┬─────────────────────────────┘
+         │
+         ▼
+┌──────────────────────────────────────┐
+│   3-LAYER PREDICTION (Cell 3,4,5,6) │
+│                                      │
+│  LAYER 1 — Rule-Based (ưu tiên)    │
+│  ├─ 101 BRAND_RULES regex           │
+│  ├─ 80+ PRODUCT_LINE_PATTERNS       │
+│  └─ OCR Typo correction             │
+│           ↓ (nếu trống)             │
+│  LAYER 2 — Machine Learning         │
+│  ├─ BrandClassifier (TF-IDF+LogReg) │
+│  ├─ ProductClassifier (gate+clf)    │
+│  └─ BrandKNN (cosine k=5)           │
+│           ↓ (bổ sung nếu ML yếu)   │
+│  LAYER 3 — Layout Analysis          │
+│  ├─ Canny Edge → Red Box            │
+│  ├─ Prominence Score ≥ 30           │
+│  └─ CHỈ BÙ, không ghi đè ML        │
+└────────┬─────────────────────────────┘
+         │
+         ▼
+┌─────────────────┐
+│ POST-PROCESSING │  reconcile_brand_product
+│ (Cell 9)        │  Social noise filter
+└────────┬────────┘  Generic token filter
+         │
+         ▼
+✅ submission.csv (7 AC checks)
 ```
 
 ---
 
-## 🔑 Key Design Decisions
+## 🚀 Cài đặt & Chạy lại
 
-### 1. Phase 2 Schema Auto-detection
-`_find_first()` recursively searches for `private_test.csv` → `test.csv` in priority order.  
-`_find_images_dir()` picks the directory with the most images, preferring folders with "test" in the path to avoid accidentally picking train images.  
-Submission columns are read directly from `sample_submission_private.csv` so the code adapts automatically to any column name changes.
+### Yêu cầu
+- Kaggle Notebook, CPU, No GPU, Internet ON
+- RAM ≥ 16 GB
 
-### 2. Brand / Product Split Layer
-`MERGED_SPLIT` maps full predicted labels into separate `(brand_name, product_name)` pairs:
+### Bước 1: Thêm Dataset
+Kaggle Notebook → **+ Add Input** → Tìm **"The 2nd URA Hackathon 2026"** → Add
 
+### Bước 2: Upload Notebook
+Upload file `tanahi-demo-ver3.ipynb` lên Kaggle.
+
+### Bước 3: Cấu hình Session
+```
+Accelerator:  None (CPU)
+Internet:     ON  ← bắt buộc (download VietOCR model lần đầu ~100MB)
+Persistence:  No persistence
+```
+
+### Bước 4: Chạy
+
+> ⚠️ **Trước khi chạy:** Bấm **Run → Restart & Clear All Outputs** để xóa cache cũ.
+
+Bấm **Run All** → đợi ~25–45 phút.
+
+Log mẫu khi chạy thành công:
+```
+CPU threads: 4 | pip workers: 4
+Installing packages (v6.0)...
+Install done. Pillow pinned to 9.5.0 ✓
+PaddleOCR detector OK | conf>0.35
+VietOCR vgg_seq2seq loaded (CPU) ✓
+Rules v4.0 | 101 rules | Smoke test: 13/13 ✓
+BrandClassifier trained: 4892 samples ✓
+[50/1202] checkpoint saved...
+[1202/1202] done ✓
+AC1 ✓ AC2 ✓ AC3 ✓ AC4 ✓ AC5 ✓ AC6 ✓ AC7 ✓
+Submission saved → /kaggle/working/submission.csv
+```
+
+### Bước 5: Download
+Kaggle → **Output** tab → Download `submission.csv`
+
+### Resume sau timeout
+Nếu bị ngắt giữa chừng, notebook tự resume từ checkpoint. Chỉ cần **Run All** lại.
+
+---
+
+## 🔩 Chi tiết từng module
+
+### Cell 1 — Cài đặt
 ```python
-'Ha Long Canfoco Pate Cột Đèn' → ('Ha Long Canfoco', 'Pate Cột Đèn')
-'Đồ Hộp Hạ Long'               → ('Hạ Long', 'Đồ Hộp')
-'Nestlé NAN'                   → ('Nestlé', 'NAN')
-'Vinamilk Dielac'              → ('Vinamilk', 'Dielac')
+paddlepaddle          # PaddleOCR backend (CPU)
+paddleocr>=2.7,<3     # OCR detection framework
+vietocr               # Vietnamese text recognition
+underthesea           # Vietnamese NLP
+scikit-learn          # ML classifiers
+Pillow==9.5.0         # Pinned! Pillow 10+ conflict với PaddleOCR
+tqdm                  # Progress bar
 ```
+> ⚠️ `Pillow==9.5.0` phải được cài **sau cùng** để override bản Pillow mới mà VietOCR kéo vào.
 
-`split_brand_product()` falls back to longest-prefix match against `KNOWN_BRANDS` for unseen labels.
+### Cell 2 — Auto-discovery đường dẫn
+Tự động tìm file CSV và thư mục ảnh, không cần hardcode. Hoạt động với Phase 1 và Phase 2.
 
-### 3. Brand Registry & Train-driven Discovery
-`BRAND_REGISTRY` is seeded from 30 `KNOWN_BRANDS` entries.  
-If `train_labels.csv` has a `brand_name` column, `build_brand_knowledge_from_train()` auto-registers new brands (min 2 samples, alias ≥ 4 chars).  
-`detect_brand_in_ocr()` scans OCR text for registered aliases:
-- Multi-word aliases: substring match
-- Single-word aliases: whole-word match only (reduces false positives)
+### Cell 3 — 101 BRAND_RULES + Utilities
+Rules regex handcrafted cho các thương hiệu phổ biến:
+- Sữa: Vinamilk, TH True Milk, Dutch Lady, Nutifood, Aptamil, HiPP...
+- Thực phẩm: Ha Long Canfoco, Vissan, Pate Cột Đèn Hải Phòng...
+- Khác: Nestlé, Abbott, Highlands Coffee...
 
-### 4. Generic Product Token Guard
-`GENERIC_PRODUCT_TOKENS` = `{'cot', 'hop', 'milk', 'sua', 'gold', ...}`  
-Single-token predictions that are generic words are suppressed to prevent noisy labels like `"Cột"` or `"Hộp"` appearing alone.
+Kèm typo correction và bộ filter social noise (TikTok caption, hashtag...).
 
-### 5. 46 Brand Rules
-Hierarchical regex patterns with OCR typo tolerance:
+### Cell 4 — Layout Pipeline
+- `find_red_box()`: Canny + dilate + contour → xác định vùng sản phẩm
+- `extract_universal_product_info_v5()`: prominence score từng text line
+- `bilingual_post_processor()`: sửa OCR lỗi song ngữ
 
-| Group | Covered brands / patterns |
-|---|---|
-| Ha Long Canfoco + Pate Cột Đèn | `canfoco`, `canfuco`, `halong canf`, `cotcen`, `cotden` |
-| Đồ Hộp Hạ Long | `đồ hộp hạ long`, `hophalong` |
-| Pate Cột Đèn Hải Phòng | `cot den hai phong`, `cotd hai` |
-| Dairy / Infant Formula | Vinamilk, TH True Milk, Dutch Lady, Nutifood, Abbott, Nestlé NAN, Aptamil, HiPP, Friso, Meiji |
-| Coffee & Beverage | Highlands Coffee, The Coffee House |
-| Meat & Pate | Vissan, Hafi, CP, Ba Huân, San Hà |
-| Other | Acnes, Ba Vì, Fami, Yomost, Anlene, Anchor … |
+### Cell 5 — Train ML Models
+Huấn luyện trực tiếp từ `train_labels.csv`:
+- **BrandClassifier**: TF-IDF char ngram(2-4) + LogReg, threshold 0.62
+- **ProductClassifier**: 2-stage gate + classifier, threshold 0.45
+- **BrandKNN**: cosine similarity k=5
 
-### 6. OCR Engine – PaddleOCR (CPU)
-- Detector: `ch_PP-OCRv4_det_infer`
-- Recogniser: `latin_PP-OCRv3_rec_infer`
-- Confidence threshold: **0.35**
-- Image preprocessing: resize ≤ 1 280 px, contrast ×1.35, sharpen
-- 4 parallel workers via `joblib` threading backend
+### Cell 6 — Predict & Evaluate
+`predict_labels()` kết hợp 3 tầng. `evaluate_pipeline()` tính F1 + Exact Match.
 
-### 7. ML Predictors
-| Model | Purpose |
-|---|---|
-| `BrandClassifier` (TF-IDF char n-gram 2–4 + LogReg) | Predict brand from OCR when rules don't match |
-| `ProductClassifier` (same architecture, 249 classes) | Predict product line from OCR |
-| `SklearnPredictor` (L4, max_feat=6000, C=1.5) | Higher-capacity LogReg fallback |
-| `KNNPredictor` (k=5, cosine similarity, thr=0.60) | Nearest-neighbour fallback |
+### Cell 7 — Dual OCR Engine
+PaddleOCR detect → crop → VietOCR recognize → sort reading order.
 
-All models are trained on `train_labels.csv` at notebook startup.
+### Cell 7b — Media Handler
+GIF/Video/WebP → sample frames → chọn frame nét nhất bằng Laplacian variance.
+
+### Cell 8 — Inference + Checkpoint
+Chạy toàn bộ test set, checkpoint mỗi 50 ảnh.
+
+### Cell 9 — Post-processing
+Bỏ token lặp liền kề trong product_name.
+
+### Cell 10 — Export + Validate
+7 assertion checks AC1-AC7 → ghi `submission.csv`.
 
 ---
 
-## 📊 Execution Summary (Phase 2 – Private Test)
+## 📈 Kết quả
 
-| Stat | Value |
+| Metric | Ước tính |
 |---|---|
-| Test images | 1 202 |
-| OCR successful | ~1 200 |
-| Runtime | ~25 min (4 CPU threads) |
-| Speed | ~0.65 s / image |
+| F1 Brand | ~0.50 |
+| 1 - CER (OCR) | ~0.75 |
+| F1 Product | ~0.60 |
+| **Score tổng** | **~0.60** |
 
 ---
 
-## 🗂️ Dataset Structure (Kaggle – Phase 2)
-
-```
-/kaggle/input/competitions/the-2nd-ura-hackathon/
-    train_labels.csv                                   # 4 892 rows
-    phase2_dataset/phase2_dataset/
-        private_test.csv                               # 1 202 rows (image_id)
-        sample_submission_private.csv                  # image_id, ocr_text, brand_name, product_name
-        images/images/                                 # 1 202 JPG test images (priv_h_*.jpg)
-```
-
-> All paths are auto-discovered. No manual editing needed.
+## 📚 References
+- [PaddleOCR](https://github.com/PaddlePaddle/PaddleOCR)
+- [VietOCR](https://github.com/pbcquoc/vietocr)
+- [The 2nd URA Hackathon 2026](https://kaggle.com/competitions/the-2nd-ura-hackathon)
 
 ---
-
-## 🚀 How to Run on Kaggle
-
-1. Add the competition dataset (Competitions tab → Add data).
-2. Ensure `RUNNING_ON_KAGGLE = True` (default).
-3. Delete any leftover checkpoint before re-running:
-   ```python
-   import os; os.remove('/kaggle/working/checkpoint.csv')
-   ```
-4. **Run All** cells top-to-bottom.
-5. Download `/kaggle/working/submission.csv` and submit.
-
----
-
-## 📦 Dependencies
-
-| Package | Purpose |
-|---|---|
-| `paddlepaddle` (CPU) | PaddleOCR backend |
-| `paddleocr ≥ 2.7, < 3` | OCR pipeline |
-| `scikit-learn` | TF-IDF + Logistic Regression |
-| `joblib` | Parallel OCR workers |
-| `tqdm` | Progress bars |
-| `Pillow` | Image loading & preprocessing |
-| `pandas`, `numpy` | Data handling |
-
-All installed automatically in the first cell.
-
----
-
-## 🧩 Notebook Cell Guide
-
-| Cell | Purpose |
-|---|---|
-| Install | Parallel pip: `paddlepaddle`, `scikit-learn`, `tqdm`, `paddleocr` |
-| Config | Auto-discover paths; detect schema columns; load train/test CSV |
-| Image index | Build `IMAGE_PATH_INDEX` for fast path lookup |
-| Rules + split layer | 46 brand rules; `BRAND_REGISTRY`; `MERGED_SPLIT`; `split_brand_product()`; smoke test 13/13 |
-| OCR engine | PaddleOCR init; image preprocessing; smoke test on first image |
-| Dual predictor v5 | `BrandClassifier` + `ProductClassifier` (TF-IDF + LogReg, 249 classes) |
-| Sklearn / KNN | `SklearnPredictor` (L4) + `KNNPredictor` (L5) for ML fallback |
-| Pipeline | `predict_product()` orchestrator: rules → ML → split → guard |
-| Cross-val | Local F1 evaluation on 20% hold-out |
-| Main loop | Parallel OCR (joblib) → predict → checkpoint every 50 imgs |
-| Export | 7 acceptance checks → save `submission.csv` aligned to `sample_submission_private.csv` |
+*TANAHI Team — HCMUT URA Research Group · 2026*
